@@ -1,0 +1,9 @@
+*.out
+tests/all_tests
+
+# Docs site (Astro)
+docs/node_modules/
+docs/dist/
+docs/.astro/
+docs/*.tsbuildinfo
+docs/src/content/docs/reference/api/

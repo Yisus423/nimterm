@@ -1,0 +1,578 @@
+## Compact transcript widget backed by nimterm's retained event reducer.
+
+import std/[json, strutils]
+from std/unicode import Rune, fastRuneAt, runeLenAt
+import ../canvas
+import ../ansi
+import ../events
+import ../geometry
+import ../keys
+import ../markdown as markdown_renderer
+import ../style
+import ../styled_text
+import ../theme
+import ../transcript as transcript_model
+import ../widget
+import ./scroll
+
+type
+  TranscriptWidget* = ref object of Widget
+    transcript*: transcript_model.Transcript
+    userStyle*: Style
+    assistantStyle*: Style
+    thinkingStyle*: Style
+    toolStyle*: Style
+    errorStyle*: Style
+    userRailStyle*: Style
+    assistantRailStyle*: Style
+    thinkingRailStyle*: Style
+    toolRailStyle*: Style
+    errorRailStyle*: Style
+    selectionStyle*: Style
+    viewport*: ScrollView
+    selectionStart*: int
+    selectionEnd*: int
+    selectionStartCol*: int
+    selectionEndCol*: int
+    searchQuery*: string
+    searchNeedle: string
+    searchMatches*: seq[int]
+    searchIndex*: int
+    searchStyle*: Style
+    toolDetails*: proc (name: string, input: JsonNode,
+                        output: string): seq[string] {.closure.}
+    formatToolLine*: proc (name, line: string): string {.closure.}
+    cachedWidth: int
+    linesValid: bool
+    itemCaches: seq[TranscriptItemCache]
+    itemStarts: seq[int]
+    totalLineCount: int
+
+  TranscriptLine = object
+    text: string
+    styled: StyledLine
+    searchText: string
+    style: Style
+    railStyle: Style
+    hasRail: bool
+
+  TranscriptItemCache = object
+    revision: int
+    width: int
+    lines: seq[TranscriptLine]
+    sourceRevision: int
+    sourceLines: seq[string]
+
+const
+  ## Prefix contract shared by the item renderer, the line wrapper, and paint.
+  railGlyph = "│"             ## marks a user or tool line
+  railPrefix = railGlyph & " "
+  statusGlyph = "· "          ## marks an informational status line
+
+proc newTranscriptWidget*(transcript = transcript_model.newTranscript(),
+                          userStyle = defaultStyle(),
+                          assistantStyle = defaultStyle(),
+                          thinkingStyle = defaultStyle(),
+                          toolStyle = defaultStyle(),
+                          errorStyle = defaultStyle()): TranscriptWidget =
+  TranscriptWidget(transcript: transcript, userStyle: userStyle,
+    assistantStyle: assistantStyle, thinkingStyle: thinkingStyle,
+    toolStyle: toolStyle, errorStyle: errorStyle,
+    viewport: newScrollView(), selectionStart: -1,
+    selectionEnd: -1, selectionStartCol: -1, selectionEndCol: -1,
+    searchIndex: -1, searchStyle: defaultStyle())
+
+proc invalidateLines*(widget: TranscriptWidget) =
+  ## Rebuild every cached item line; use after mutating an item in place.
+  widget.linesValid = false
+  for cache in widget.itemCaches.mitems:
+    cache.revision = -1
+    cache.sourceRevision = -1
+
+proc contentWidth(widget: TranscriptWidget): int =
+  ## Reserve the final column for the scrollbar so text never hides beneath it.
+  if widget.area.w <= 1: widget.area.w else: widget.area.w - 1
+
+proc appendUser*(widget: TranscriptWidget, text: string) =
+  widget.transcript.appendUser(text)
+  widget.linesValid = false
+
+proc appendStatus*(widget: TranscriptWidget, text: string) =
+  widget.transcript.items.add TranscriptItem(kind: tikStatus, text: text)
+  widget.linesValid = false
+
+proc setTranscript*(widget: TranscriptWidget,
+                    transcript: transcript_model.Transcript) =
+  widget.transcript = transcript
+  widget.itemCaches.setLen(0)
+  widget.itemStarts.setLen(0)
+  widget.invalidateLines()
+
+method focusable*(widget: TranscriptWidget): bool = true
+
+proc itemLines(widget: TranscriptWidget,
+               item: transcript_model.TranscriptItem): seq[string] =
+  case item.kind
+  of tikUser:
+    result.add railPrefix & "You"
+    for line in item.text.splitLines:
+      result.add railPrefix & currentTheme.paint(currentTheme.boldAccent, line)
+  of tikAssistant:
+    for line in markdown_renderer.renderMarkdownLines(item.text, widget.contentWidth):
+      result.add line.text
+  of tikThinking:
+    if item.pending and not item.expanded:
+      result.add "Thinking …"
+      return
+    let lines = item.text.splitLines
+    if item.expanded:
+      result.add "Thinking"
+      for line in lines: result.add line
+    else:
+      result.add "Thinking · " & $lines.len &
+        (if lines.len == 1: " line" else: " lines") & " (Ctrl-O)"
+  of tikTool:
+    let glyph = if item.isError: currentTheme.paint(currentTheme.error, "✗")
+                elif item.pending: currentTheme.paint(currentTheme.muted, "…")
+                else: currentTheme.paint(currentTheme.success, "✓")
+    result.add railPrefix & glyph & " " & item.title
+    let details = if not item.pending and not item.isError and
+        not widget.toolDetails.isNil:
+      widget.toolDetails(item.title, item.toolInput, item.text)
+    else: @[]
+    if details.len > 0:
+      let shownDetails = if item.expanded: details.len else: min(3, details.len)
+      for i in 0 ..< shownDetails:
+        let detail = if i == 0 and details[i] ==
+            item.toolInput.getOrDefault("path").getStr:
+          currentTheme.paint(currentTheme.muted, details[i])
+        else:
+          details[i]
+        result.add "│   " & detail
+      if not item.expanded and details.len > shownDetails:
+        result.add "│   … " & $(details.len - shownDetails) &
+          " detail lines (Ctrl-O)"
+    let lines = item.text.splitLines
+    let shown = if item.expanded: lines.len else: min(2, lines.len)
+    for i in 0 ..< shown:
+      result.add "│   " & (if widget.formatToolLine.isNil: lines[i]
+        else: widget.formatToolLine(item.title, lines[i]))
+    if not item.expanded and lines.len > shown:
+      result.add "│   … " & $(lines.len - shown) & " more (Ctrl-O)"
+    if item.pending:
+      result.add "│   " & currentTheme.paint(currentTheme.muted, "working")
+    if item.approvalRequired:
+      for choice in item.approvalChoices:
+        result.add "│   [" & choice.key & "] " & choice.label
+  of tikError:
+    for line in item.text.splitLines: result.add line
+  of tikStatus:
+    for line in item.text.splitLines: result.add statusGlyph & line
+
+proc itemStyle(widget: TranscriptWidget, kind: TranscriptItemKind): Style =
+  case kind
+  of tikUser: widget.userStyle
+  of tikAssistant: widget.assistantStyle
+  of tikThinking: widget.thinkingStyle
+  of tikTool: widget.toolStyle
+  of tikError: widget.errorStyle
+  of tikStatus: widget.thinkingStyle
+
+proc itemRailStyle(widget: TranscriptWidget, kind: TranscriptItemKind): Style =
+  case kind
+  of tikUser: widget.userRailStyle
+  of tikAssistant: widget.assistantRailStyle
+  of tikThinking: widget.thinkingRailStyle
+  of tikTool: widget.toolRailStyle
+  of tikError: widget.errorRailStyle
+  of tikStatus: widget.thinkingRailStyle
+
+proc wrapTranscriptLine(text: string, width: int,
+                        preservePrefix = false): seq[string] =
+  ## Keep a rail glyph or bullet and its following spaces on every wrapped line.
+  if width <= 0: return @[text]
+  var prefixLen = 0
+  if preservePrefix:
+    if text.startsWith(railGlyph): prefixLen = railGlyph.len
+    elif text.startsWith(statusGlyph): prefixLen = statusGlyph.len
+  while prefixLen < text.len and text[prefixLen] == ' ':
+    inc prefixLen
+  let prefix = text[0 ..< prefixLen]
+  let body = text[prefixLen .. ^1]
+  for chunk in wrapAnsi(body, max(1, width - ansiVisibleWidth(prefix)), true):
+    result.add prefix & chunk
+
+proc hiddenThinkingDelta(widget: TranscriptWidget, event: AgentUiEvent): bool =
+  if event.kind != ueThinkingDelta or event.text.len == 0: return false
+  let id = event.runId & ":" & $event.step & ":thinking"
+  for item in widget.transcript.items:
+    if item.id == id:
+      return item.pending and not item.expanded
+
+proc apply*(widget: TranscriptWidget, event: AgentUiEvent) =
+  let hidden = widget.hiddenThinkingDelta(event)
+  widget.transcript.apply(event)
+  ## Hidden thinking deltas only grow item text, so item caches stay valid.
+  if not hidden: widget.linesValid = false
+
+proc awaitingApproval*(widget: TranscriptWidget): bool =
+  for item in widget.transcript.items:
+    if item.approvalRequired:
+      return true
+
+proc ensureLayout(widget: TranscriptWidget) =
+  let width = widget.contentWidth
+  if widget.linesValid and widget.cachedWidth == width:
+    return
+  if widget.itemCaches.len != widget.transcript.items.len:
+    widget.itemCaches.setLen(widget.transcript.items.len)
+  widget.itemStarts.setLen(widget.transcript.items.len)
+  var total = 0
+  for i, item in widget.transcript.items:
+    let cache = addr widget.itemCaches[i]
+    if cache[].revision != item.revision or cache[].width != width or
+        cache[].lines.len == 0:
+      cache[].lines.setLen(0)
+      let style = widget.itemStyle(item.kind)
+      let railStyle = widget.itemRailStyle(item.kind)
+      if item.kind == tikAssistant:
+        for line in markdown_renderer.renderMarkdownLines(item.text, width):
+          for wrapped in line.wrap(width):
+            cache[].lines.add TranscriptLine(text: wrapped.text,
+              styled: wrapped, searchText: wrapped.text.toLowerAscii,
+              style: style, railStyle: railStyle)
+      elif cache[].sourceRevision != item.revision or cache[].sourceLines.len == 0:
+        cache[].sourceLines = widget.itemLines(item)
+        cache[].sourceRevision = item.revision
+      if item.kind != tikAssistant:
+        for line in cache[].sourceLines:
+          let preservePrefix = item.kind in {tikUser, tikTool, tikStatus}
+          let hasRail = item.kind in {tikUser, tikTool} and line.startsWith(railGlyph)
+          for wrapped in wrapTranscriptLine(line, width, preservePrefix):
+            cache[].lines.add TranscriptLine(text: wrapped,
+              searchText: stripAnsi(wrapped).toLowerAscii, style: style,
+              railStyle: railStyle, hasRail: hasRail)
+      cache[].revision = item.revision
+      cache[].width = width
+    if i > 0: inc total
+    widget.itemStarts[i] = total
+    total += cache[].lines.len
+  widget.totalLineCount = total
+  widget.cachedWidth = width
+  widget.linesValid = true
+
+proc lineCount(widget: TranscriptWidget): int =
+  widget.ensureLayout()
+  widget.totalLineCount
+
+proc lineAt(widget: TranscriptWidget, index: int): TranscriptLine =
+  widget.ensureLayout()
+  if index < 0 or index >= widget.totalLineCount: return
+  var lo = 0
+  var hi = widget.itemStarts.high
+  while lo <= hi:
+    let mid = (lo + hi) div 2
+    if widget.itemStarts[mid] <= index: lo = mid + 1
+    else: hi = mid - 1
+  if hi >= 0:
+    let local = index - widget.itemStarts[hi]
+    if local < widget.itemCaches[hi].lines.len:
+      return widget.itemCaches[hi].lines[local]
+  TranscriptLine(style: defaultStyle(), railStyle: defaultStyle())
+
+proc selectionColumns(widget: TranscriptWidget, line: int): tuple[lo, hi: int] =
+  result = (-1, -1)
+  if widget.selectionStart < 0 or widget.selectionEnd < 0: return
+  let startLine = widget.selectionStart
+  let endLine = widget.selectionEnd
+  let startCol = widget.selectionStartCol
+  let endCol = widget.selectionEndCol
+  let lastCol = widget.contentWidth - 1
+  if startLine == endLine:
+    if line == startLine: result = (min(startCol, endCol), max(startCol, endCol))
+  elif startLine < endLine:
+    if line == startLine: result = (startCol, lastCol)
+    elif line == endLine: result = (0, endCol)
+    elif line > startLine and line < endLine: result = (0, lastCol)
+  elif line == startLine:
+    result = (startCol, lastCol)
+  elif line == endLine:
+    result = (0, endCol)
+  elif line < startLine and line > endLine:
+    result = (0, lastCol)
+
+proc runeSlice(text: string, first, last: int): string =
+  if first > last: return
+  var i = 0
+  var column = 0
+  while i < text.len:
+    var rune: Rune
+    fastRuneAt(text, i, rune, doInc = false)
+    let width = runeLenAt(text, i)
+    if column >= first and column <= last:
+      let stop = min(text.len, i + width)
+      if stop > i: result.add text[i ..< stop]
+    i = min(text.len, i + width)
+    inc column
+
+proc selectedText*(widget: TranscriptWidget): string =
+  let count = widget.lineCount()
+  if widget.selectionStart < 0 or widget.selectionEnd < 0 or count == 0:
+    return ""
+  let first = max(0, min(widget.selectionStart, widget.selectionEnd))
+  let last = min(count - 1, max(widget.selectionStart, widget.selectionEnd))
+  for i in first .. last:
+    let transcriptLine = widget.lineAt(i)
+    var line = stripAnsi(transcriptLine.text)
+    var prefixColumns = 0
+    if transcriptLine.hasRail and line.startsWith(railPrefix):
+      line = if line.len > railPrefix.len: line[railPrefix.len .. ^1] else: ""
+      prefixColumns = 2
+    elif transcriptLine.hasRail and line == railGlyph:
+      line = ""
+      prefixColumns = 1
+    elif line.startsWith(statusGlyph):
+      line = if line.len > statusGlyph.len: line[statusGlyph.len .. ^1] else: ""
+      prefixColumns = 2
+    let bounds = widget.selectionColumns(i)
+    let firstColumn = max(0, bounds.lo - prefixColumns)
+    let lastColumn = bounds.hi - prefixColumns
+    let selected = runeSlice(line, firstColumn, lastColumn)
+    if selected.len == 0: continue
+    if result.len > 0: result.add '\n'
+    result.add selected
+
+proc revealSearchMatch(widget: TranscriptWidget) =
+  if widget.searchIndex < 0 or widget.searchIndex >= widget.searchMatches.len:
+    return
+  widget.viewport.update(widget.lineCount(), widget.area.h)
+  let target = widget.searchMatches[widget.searchIndex]
+  widget.viewport.offset = clamp(target - widget.area.h div 2,
+    0, widget.viewport.maxOffset)
+  widget.viewport.followTail = widget.viewport.offset == widget.viewport.maxOffset
+
+proc setSearch*(widget: TranscriptWidget, query: string): int =
+  let normalized = query.strip
+  let needle = normalized.toLowerAscii
+  let previousNeedle = widget.searchNeedle
+  if needle == previousNeedle:
+    widget.searchIndex = if widget.searchMatches.len > 0: 0 else: -1
+    if widget.searchIndex >= 0: widget.revealSearchMatch()
+    return widget.searchMatches.len
+  widget.searchQuery = normalized
+  widget.searchNeedle = needle
+  widget.searchIndex = -1
+  if needle.len == 0:
+    widget.searchMatches.setLen(0)
+    return
+  if previousNeedle.len > 0 and needle.len > previousNeedle.len and
+      needle.startsWith(previousNeedle):
+    var narrowed: seq[int]
+    for i in widget.searchMatches:
+      if widget.lineAt(i).searchText.find(needle) >= 0:
+        narrowed.add i
+    widget.searchMatches = narrowed
+  else:
+    widget.searchMatches.setLen(0)
+    for i in 0 ..< widget.lineCount():
+      if widget.lineAt(i).searchText.find(needle) >= 0:
+        widget.searchMatches.add i
+  if widget.searchMatches.len > 0:
+    widget.searchIndex = 0
+    widget.revealSearchMatch()
+  widget.searchMatches.len
+
+proc clearSearch*(widget: TranscriptWidget) =
+  discard widget.setSearch("")
+
+proc nextSearch*(widget: TranscriptWidget, backwards = false): bool =
+  if widget.searchMatches.len == 0: return false
+  let step = if backwards: -1 else: 1
+  widget.searchIndex = (widget.searchIndex + step + widget.searchMatches.len) mod
+    widget.searchMatches.len
+  widget.revealSearchMatch()
+  true
+
+proc paintSearchMatches(widget: TranscriptWidget, canvas: var Canvas,
+                        text: string, x, y, width: int) =
+  if widget.searchQuery.len == 0 or width <= 0: return
+  let plain = stripAnsi(text)
+  let needle = widget.searchNeedle
+  let lowerPlain = plain.toLowerAscii
+  var startAt = 0
+  while startAt < lowerPlain.len:
+    let hit = lowerPlain.find(needle, startAt)
+    if hit < 0: break
+    let before = ansiVisibleWidth(plain[0 ..< hit])
+    let matchWidth = max(1, ansiVisibleWidth(plain[hit ..< hit + needle.len]))
+    for column in before ..< min(width, before + matchWidth):
+      var cell = canvas.getCell(x + column, y)
+      cell.style = widget.searchStyle
+      canvas.setCell(x + column, y, cell)
+    startAt = hit + max(1, needle.len)
+
+proc copySelection*(widget: TranscriptWidget): EventResponse =
+  let text = widget.selectedText()
+  if text.len == 0: return eventIgnored
+  widget.actionHandled("copy", text)
+
+proc scrollBy*(widget: TranscriptWidget, delta: int) =
+  widget.viewport.update(widget.lineCount(), widget.area.h)
+  widget.viewport.scrollBy(-delta)
+
+method handle*(widget: TranscriptWidget, event: UiEvent): EventResponse =
+  widget.viewport.update(widget.lineCount(), widget.area.h)
+  case event.kind
+  of uiKey:
+    case event.key
+    of keyPageUp, keyCtrlB:
+      widget.viewport.pageBy(-1)
+    of keyPageDown, keyCtrlF:
+      widget.viewport.pageBy(1)
+    of keyHome:
+      widget.viewport.home()
+    of keyEnd:
+      widget.viewport.tail()
+    of keyChar, keyEnter:
+      for i in countdown(widget.transcript.items.high, 0):
+        if not widget.transcript.items[i].approvalRequired: continue
+        let key = if event.key == keyEnter: "enter" else: event.text.toLowerAscii
+        var selected = -1
+        for j, choice in widget.transcript.items[i].approvalChoices:
+          if choice.key.toLowerAscii == key: selected = j
+        if selected < 0: return eventIgnored
+        let choice = widget.transcript.items[i].approvalChoices[selected]
+        widget.transcript.items[i].approvalRequired = false
+        widget.invalidateLines()
+        return widget.actionHandled("approval", choice.id,
+          targetId = widget.transcript.items[i].id)
+      return eventIgnored
+    of keyEscape:
+      for i in countdown(widget.transcript.items.high, 0):
+        if not widget.transcript.items[i].approvalRequired: continue
+        let choiceId = widget.transcript.items[i].cancelChoiceId
+        widget.transcript.items[i].approvalRequired = false
+        widget.invalidateLines()
+        return widget.actionHandled("approval", choiceId,
+          targetId = widget.transcript.items[i].id)
+      return eventIgnored
+    of keyCtrlO:
+      var expandable = false
+      var expand = false
+      for item in widget.transcript.items:
+        let details = if item.kind == tikTool and not item.isError and
+            not widget.toolDetails.isNil:
+          widget.toolDetails(item.title, item.toolInput, item.text)
+        else: @[]
+        let canExpand = (item.kind == tikThinking and item.text.len > 0) or
+          (item.kind == tikTool and (item.text.splitLines.len > 2 or
+            details.len > 2))
+        if canExpand:
+          expandable = true
+          if not item.expanded: expand = true
+      if not expandable: return eventIgnored
+      for item in widget.transcript.items.mitems:
+        let details = if item.kind == tikTool and not item.isError and
+            not widget.toolDetails.isNil:
+          widget.toolDetails(item.title, item.toolInput, item.text)
+        else: @[]
+        let canExpand = (item.kind == tikThinking and item.text.len > 0) or
+          (item.kind == tikTool and (item.text.splitLines.len > 2 or
+            details.len > 2))
+        if canExpand:
+          item.expanded = expand
+      widget.invalidateLines()
+      widget.viewport.update(widget.lineCount(), widget.area.h)
+      return eventHandled
+    else:
+      return eventIgnored
+  of uiMouse:
+    if event.scrollDelta != 0:
+      widget.scrollBy(event.scrollDelta)
+      return eventHandled
+    if not widget.area.contains(event.x, event.y): return eventIgnored
+    let line = widget.viewport.offset + event.y - widget.area.y
+    if line < 0 or line >= widget.lineCount(): return eventIgnored
+    case event.mouse
+    of umPress:
+      widget.selectionStart = line
+      widget.selectionEnd = line
+      widget.selectionStartCol = clamp(event.x - widget.area.x, 0,
+        max(0, widget.contentWidth - 1))
+      widget.selectionEndCol = widget.selectionStartCol
+      return captureHandled()
+    of umDrag:
+      if widget.selectionStart >= 0:
+        widget.selectionEnd = line
+        widget.selectionEndCol = clamp(event.x - widget.area.x, 0,
+          max(0, widget.contentWidth - 1))
+        return eventHandled
+    of umRelease:
+      if widget.selectionStart >= 0:
+        widget.selectionEnd = line
+        widget.selectionEndCol = clamp(event.x - widget.area.x, 0,
+          max(0, widget.contentWidth - 1))
+        let copy = widget.copySelection()
+        result = releaseHandled()
+        result.action = copy.action
+        return
+    else:
+      discard
+  else:
+    return eventIgnored
+  eventHandled
+
+method measure*(widget: TranscriptWidget, constraints: Constraints): Size =
+  var height = 0
+  var width = 0
+  for i, item in widget.transcript.items:
+    if i > 0: inc height
+    for line in widget.itemLines(item):
+      width = max(width, ansiVisibleWidth(line))
+      inc height
+  constraints.clamp(size(width, height))
+
+method paint*(widget: TranscriptWidget, canvas: var Canvas) =
+  let count = widget.lineCount()
+  widget.viewport.update(count, widget.area.h)
+  let start = widget.viewport.offset
+  let stop = min(count, start + widget.area.h)
+  if start < stop:
+    let width = widget.contentWidth
+    var y = widget.area.y
+    for i in start ..< stop:
+      let line = widget.lineAt(i)
+      let lineStyle = line.style
+      let railStyle = line.railStyle
+      for x in widget.area.x ..< widget.area.x + width:
+        canvas.setCell(x, y, Cell(glyph: Rune(32), style: lineStyle))
+      if line.hasRail:
+        let body = line.text[railGlyph.len .. ^1]
+        canvas.writeText(widget.area.x, y, railGlyph, railStyle, 1)
+        canvas.writeAnsiText(widget.area.x + 1, y, body, lineStyle,
+          max(0, width - 1))
+        widget.paintSearchMatches(canvas, body, widget.area.x + 1, y,
+          max(0, width - 1))
+      else:
+        if line.styled.len > 0:
+          line.styled.write(canvas, widget.area.x, y, width, lineStyle)
+        else:
+          canvas.writeAnsiText(widget.area.x, y, line.text, lineStyle, width)
+        widget.paintSearchMatches(canvas, line.text, widget.area.x, y, width)
+      let bounds = widget.selectionColumns(i)
+      if bounds.lo >= 0:
+        for x in max(0, bounds.lo) .. min(width - 1, bounds.hi):
+          var cell = canvas.getCell(widget.area.x + x, y)
+          cell.style = widget.selectionStyle
+          canvas.setCell(widget.area.x + x, y, cell)
+      inc y
+  if widget.area.w > 0 and widget.area.h > 0 and count > widget.area.h:
+    let trackStyle = currentTheme.muted
+    let thumbHeight = max(1, widget.area.h * widget.area.h div count)
+    let thumbTop = if widget.viewport.maxOffset == 0: 0
+                   else: (widget.area.h - thumbHeight) * widget.viewport.offset div
+                     widget.viewport.maxOffset
+    let x = widget.area.x + widget.area.w - 1
+    for row in 0 ..< widget.area.h:
+      let glyph = if row >= thumbTop and row < thumbTop + thumbHeight: "┃" else: "┊"
+      canvas.writeText(x, widget.area.y + row, glyph, trackStyle, 1)
