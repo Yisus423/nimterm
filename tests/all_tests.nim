@@ -649,6 +649,20 @@ suite "core canvas and app":
     check "○ two" in canvas.plainText
 
 suite "transcript":
+  test "appendItem grows the transcript without dropping what is there":
+    let widget = newTranscriptWidget()
+    widget.appendUser("first")
+    var canvas = newCanvas(size(30, 4))
+    widget.render(canvas, rect(0, 0, 30, 4))
+    # What was rendered once stays, and the item added after it shows up on the
+    # next render: that is the append for a growing transcript, unlike
+    # setTranscript which clears every cached line.
+    widget.appendItem(TranscriptItem(kind: tikStatus, text: "second"))
+    canvas = newCanvas(size(30, 6))
+    widget.render(canvas, rect(0, 0, 30, 6))
+    check widget.transcript.items.len == 2
+    check "first" in canvas.plainText
+    check "second" in canvas.plainText
   test "streaming preserves manual position and follows an active tail":
     let widget = newTranscriptWidget()
     widget.apply AgentUiEvent(kind: ueTextDelta, runId: "run", step: 0,

@@ -101,6 +101,15 @@ proc appendStatus*(widget: TranscriptWidget, text: string) =
   widget.transcript.items.add TranscriptItem(kind: tikStatus, text: text)
   widget.linesValid = false
 
+proc appendItem*(widget: TranscriptWidget, item: TranscriptItem) =
+  ## Add one item and mark the cached lines stale. The per-item caches of the
+  ## items already there stay valid, which is the difference from
+  ## `setTranscript`: that one clears every cache and rewraps the whole
+  ## transcript. Use this to grow a transcript (a session gaining entries)
+  ## without paying for what did not change.
+  widget.transcript.items.add item
+  widget.linesValid = false
+
 proc setTranscript*(widget: TranscriptWidget,
                     transcript: transcript_model.Transcript) =
   widget.transcript = transcript
