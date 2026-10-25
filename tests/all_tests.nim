@@ -52,6 +52,19 @@ suite "terminal input decoding":
   test "normalizes modified key encodings":
     check decodeBytes("\e[118;5u").key == keyCtrlV
     check decodeBytes("\e[99;6u").key == keyCopy
+    # Ctrl+letter in the encodings a terminal uses once the app enabled
+    # modifyOtherKeys or the kitty keyboard protocol. A multiplexer that
+    # honors the mode (herdr does) sends these instead of the classic control
+    # byte, and an app that asked for the mode has to understand the answer:
+    # mods 5 is Ctrl alone, and the letter's ASCII code is 99 for "c".
+    check decodeBytes("\e[99;5u").key == keyCtrlC
+    check decodeBytes("\e[27;5;99~").key == keyCtrlC
+    check decodeBytes("\e[115;5u").key == keyCtrlS
+    check decodeBytes("\e[27;5;122~").key == keyCtrlZ
+    # The modifiers that already had a meaning keep it: Ctrl+Shift+C is copy,
+    # not Ctrl+C, and Ctrl+V is paste.
+    check decodeBytes("\e[99;6u").key == keyCopy
+    check decodeBytes("\e[118;5u").key == keyCtrlV
     check decodeBytes("\e[111;5u").key == keyCtrlO
     check decodeBytes("\e\r").key == keyAltEnter
     check decodeBytes("\e[13;3u").key == keyAltEnter

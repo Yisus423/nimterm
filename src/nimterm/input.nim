@@ -148,6 +148,22 @@ proc modifiedCtrlO(seq: string): bool =
   let (code, mods) = modifiedKey(seq)
   code == ord('o') and ((mods - 1) and 4) != 0
 
+proc modifiedCtrlKey*(seq: string): Key =
+  ## The Ctrl+letter encoding a terminal sends once the app has enabled
+  ## modifyOtherKeys (`27;5;<code>~`, xterm) or the kitty keyboard protocol
+  ## (`<code>;5u`), where `<code>` is the letter's ASCII code — 99 for "c".
+  ##
+  ## This is the general case behind the specific ones above: a terminal that
+  ## honors the mode stops sending the classic control byte, so Ctrl+C arrives
+  ## as one of these and an app that asked for the mode has to understand the
+  ## answer. Ctrl alone is modifier 5; a modifier that already means something
+  ## (Ctrl+Shift+C is the copy key, Ctrl+V is paste) is matched earlier in the
+  ## chain and never reaches here.
+  let (code, mods) = modifiedKey(seq)
+  if mods != 5 or code < ord('a') or code > ord('z'):
+    return keyNone
+  ctrlKey(code - 96)
+
 proc readBracketedPaste(readNext: ByteReader): UiEvent =
   ## Bytes between ESC [ 200 ~ and ESC [ 201 ~.
   var acc = ""
@@ -268,6 +284,8 @@ proc readEscapeSequence(readNext: ByteReader): UiEvent =
       result.key = keyCopy
     elif modifiedCtrlO(seq):
       result.key = keyCtrlO
+    elif modifiedCtrlKey(seq) != keyNone:
+      result.key = modifiedCtrlKey(seq)
     elif seq == "200~":
       return readBracketedPaste(readNext)
     elif seq == "3~": result.key = keyDelete
