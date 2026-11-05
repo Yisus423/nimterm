@@ -110,6 +110,71 @@ makes an idle app poll at `pollIntervalMs`, defaulting to 16 milliseconds. A
 source can override it to return `false` while idle. If `poll` raises a
 `CatchableError`, the app posts a `uiError`, closes the source, and removes it.
 
+## Limits an embedder must design around
+
+`App` is deliberately small: one thread, one dispatch path, and no promises
+about anything else. These are the behaviours an embedder meets first, each one
+read off the source rather than inferred.
+
+**A nested `step` is not guarded.** `App` carries no in-step flag
+(`src/nimterm/app.nim:25-41`) and `dispatch` calls your callback directly
+(`src/nimterm/app.nim:163-168`), so a `step` called from inside a handler
+recursively dispatches another event while the outer one is still running.
+Nothing in the library documents or tests that as safe. If you have to keep the
+interface alive during a long call, make it one non-reentrant pump with a guard
+of your own.
+
+**One event per `step`.** `step` pops the queue, polls the sources, blocks in
+`backend.readEvent` for the timeout it was given, polls the sources again,
+dispatches, and flushes (`src/nimterm/app.nim:213-237`). `run` passes
+`idleTimeout`: `pollIntervalMs` (16 ms by default, `src/nimterm/app.nim:50`)
+when some source returns `needsPolling = true`, and otherwise `-1`, an
+indefinite block until input, a `post`, or the earliest due timer
+(`src/nimterm/app.nim:86-105,239-252`).
+
+**`EventSource.poll` runs synchronously.** `collectEvents` calls it on the same
+thread that is about to dispatch and render
+(`src/nimterm/app.nim:63-75`), so a `poll` that blocks on a pipe freezes the
+interface exactly as long as it blocks — and a `poll` that raises
+`CatchableError` costs you the source: the app posts `uiError`, closes the
+source, and removes it. Spawn the producer asynchronously and keep `poll` to
+non-blocking reads.
+
+**The POSIX backend watches two descriptors.** The `select` in `inputReady`
+sets `STDIN_FILENO` and `backend.wakeRead`, and nothing else
+(`src/nimterm/platform_posix.nim:128-140`). To bring a child process's output
+into the loop, read it from your own `EventSource`; the backend will not poll
+its descriptor for you.
+
+**A repaint request is not thread-safe.** The event queue is the only
+synchronized piece of the library (`src/nimterm/queue.nim:1-22`); `invalidate`,
+`flush`, and `render` are not. `post` enqueues under the queue's lock and wakes
+a blocked `readEvent`, and that is the whole cross-thread story: keep another
+thread away from `App` unless you bring your own synchronization.
+
+**A copied `App` shares more than it owns.** Assignment copies the value fields
+— `running`, `dirty`, `frame`, `timers`, `sources`, `lastPresent` — while
+`backend`, `queue`, the widget tree, and the source objects stay shared
+(`src/nimterm/app.nim:25-41`). The copy dispatches through the same queue and
+draws on the same canvas, but a source or timer added to the original after the
+copy never reaches the copy you pump, and `running` belongs to whichever copy
+you set it on. Keep one canonical `App` and drive that one.
+
+### What a change in the library could add
+
+These limits are all workable from the embedding side, which is why they are
+documented rather than enforced. A library-side fix would pick them off in this
+order:
+
+- a reentrancy guard on `step`, so pumping from a handler is either safe or
+  refused loudly instead of silently nesting;
+- a thread-safe repaint request, so a producer on its own thread needs no
+  hand-rolled synchronization;
+- a backend or source that can wait on arbitrary descriptors, so a child's pipe
+  is a first-class event source;
+- an `EventSource` for a spawned child out of the box, the way agent frontends
+  always need one.
+
 ## Handle failures
 
 An exception from `onEvent` or a widget handler becomes a `uiError` event on a
