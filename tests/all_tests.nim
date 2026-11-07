@@ -776,6 +776,18 @@ suite "transcript":
     check "body" in canvas.plainText
     check "line" in canvas.plainText
 
+  test "the folded reasoning's key hint is the application's":
+    # An application whose thinking key is not Ctrl+O says so; the default keeps
+    # this widget's own key, which the test above pins.
+    let view = newTranscriptWidget(thinkingHint = " (Ctrl+T)")
+    view.apply AgentUiEvent(kind: ueThinkingDelta, runId: "run", step: 0,
+      text: "private\nreason")
+    view.apply AgentUiEvent(kind: ueStepFinished, runId: "run", step: 0)
+    var canvas = newCanvas(size(40, 10))
+    view.render(canvas, rect(0, 0, 40, 10))
+    check "Thinking · 2 lines (Ctrl+T)" in canvas.plainText
+    check "Ctrl-O" notin canvas.plainText
+
   test "recedes thinking and makes tool status scannable":
     let view = newTranscriptWidget()
     view.apply AgentUiEvent(kind: ueThinkingDelta, runId: "run", step: 0,

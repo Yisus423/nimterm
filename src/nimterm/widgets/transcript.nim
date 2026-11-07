@@ -26,6 +26,10 @@ type
     userRailStyle*: Style
     assistantRailStyle*: Style
     thinkingRailStyle*: Style
+    thinkingHint*: string
+      ## The key hint the folded reasoning shows after its line count, so an
+      ## application whose thinking key is not Ctrl+O can say which one it is.
+      ## Empty hides the hint; the default keeps this widget's own key.
     toolRailStyle*: Style
     errorRailStyle*: Style
     selectionStyle*: Style
@@ -74,10 +78,11 @@ proc newTranscriptWidget*(transcript = transcript_model.newTranscript(),
                           assistantStyle = defaultStyle(),
                           thinkingStyle = defaultStyle(),
                           toolStyle = defaultStyle(),
-                          errorStyle = defaultStyle()): TranscriptWidget =
+                          errorStyle = defaultStyle(),
+                          thinkingHint = " (Ctrl-O)"): TranscriptWidget =
   TranscriptWidget(transcript: transcript, userStyle: userStyle,
     assistantStyle: assistantStyle, thinkingStyle: thinkingStyle,
-    toolStyle: toolStyle, errorStyle: errorStyle,
+    toolStyle: toolStyle, errorStyle: errorStyle, thinkingHint: thinkingHint,
     viewport: newScrollView(), selectionStart: -1,
     selectionEnd: -1, selectionStartCol: -1, selectionEndCol: -1,
     searchIndex: -1, searchStyle: defaultStyle())
@@ -139,7 +144,7 @@ proc itemLines(widget: TranscriptWidget,
       for line in lines: result.add line
     else:
       result.add "Thinking · " & $lines.len &
-        (if lines.len == 1: " line" else: " lines") & " (Ctrl-O)"
+        (if lines.len == 1: " line" else: " lines") & widget.thinkingHint
   of tikTool:
     let glyph = if item.isError: currentTheme.paint(currentTheme.error, "✗")
                 elif item.pending: currentTheme.paint(currentTheme.muted, "…")
