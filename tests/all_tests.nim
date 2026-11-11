@@ -3,6 +3,7 @@ from std/unicode import Rune
 import nimterm/[ansi, app, backend, canvas, events, geometry, input, markdown, keys,
   style, text_width, theme, transcript, widget, widgets]
 import nimterm/term
+import ./picker_tests
 when not defined(windows):
   import nimterm/platform_posix
 else:

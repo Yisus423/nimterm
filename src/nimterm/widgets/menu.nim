@@ -55,7 +55,9 @@ proc contentRows(widget: Menu): int =
 proc keepSelectionVisible(widget: Menu, rows: int) =
   if rows <= 0 or widget.items.len == 0: return
   widget.scrollOffset = clamp(widget.scrollOffset, 0, max(0, widget.items.len - rows))
-  if widget.selected < widget.scrollOffset:
+  if widget.selected < 0:
+    widget.scrollOffset = 0
+  elif widget.selected < widget.scrollOffset:
     widget.scrollOffset = widget.selected
   elif widget.selected >= widget.scrollOffset + rows:
     widget.scrollOffset = widget.selected - rows + 1
@@ -135,7 +137,7 @@ method paint*(widget: Menu, canvas: var Canvas) =
     let baseStyle = if index == widget.selected: widget.selectedStyle else: widget.style
     for col in x + inset ..< x + widget.area.w - inset:
       canvas.setCell(col, rowY, Cell(glyph: Rune(32), style: baseStyle))
-    if index >= widget.items.len: continue
+    if index < 0 or index >= widget.items.len: continue
     let item = widget.items[index]
     let marker = if index == widget.selected: "▸ " else: "  "
     let label = marker & item.label.alignLeft(labelWidth)
